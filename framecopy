@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: framecopy [-e both|left|right] [-s WxH] [-f fps] [-b bitrate] [user@host]" >&2
+  exit 2
+}
+
+eye=both
+size=
+fps=30
+bitrate=6M
+while getopts e:s:f:b: opt; do
+  case $opt in
+    e) eye=$OPTARG ;;
+    s) size=$OPTARG ;;
+    f) fps=$OPTARG ;;
+    b) bitrate=$OPTARG ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+host=${1:-steamos@frame}
+dir=$(dirname "$(readlink -f "$0")")
+
+[[ $eye =~ ^(both|left|right)$ ]] || usage
+[[ $fps =~ ^[0-9]+$ ]] || usage
+[[ $bitrate =~ ^[0-9]+[kKmM]?$ ]] || usage
+if [[ -z $size ]]; then
+  [[ $eye == both ]] && size=1920x960 || size=960x960
+fi
+[[ $size =~ ^[0-9]+x[0-9]+$ ]] || usage
+
+remote=$(ssh "$host" 'echo $HOME/.cache/framecopy')
+ssh "$host" "mkdir -p $remote"
+
+# build <name> <libs> <files...>
+build() {
+  local name=$1 libs=$2 sum srcs
+  shift 2
+  sum=$(cd "$dir/src" && cat "$@" | sha256sum | cut -d' ' -f1)
+  if ssh "$host" "[ \"\$(cat $remote/$name.sum 2>/dev/null)\" = $sum ]"; then
+    return
+  fi
+  srcs=$(printf '%s\n' "$@" | grep '\.c$' | tr '\n' ' ')
+  (cd "$dir/src" && scp -q "$@" "$host:$remote/")
+  ssh "$host" "cd $remote &&
+    gcc -O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 -o $name $srcs $libs &&
+    echo $sum > $name.sum"
+}
+build framecopy-kms '$(pkg-config --cflags --libs libdrm)' kms.c proto.c proto.h util.h
+build framecopy-capture -lvulkan capture.c gpu.c gpu.h proto.c proto.h util.h
+
+if ! ssh "$host" "getcap $remote/framecopy-kms" | grep -q cap_sys_admin; then
+  echo "run once: ssh -t $host sudo setcap cap_sys_admin+ep $remote/framecopy-kms" >&2
+  exit 1
+fi
+
+ssh "$host" "$remote/framecopy-capture -e $eye -s $size -f $fps |
+  ffmpeg -loglevel error -f rawvideo -pix_fmt bgr0 -video_size $size -framerate $fps -i - \
+    -vf format=yuv420p -c:v libx264 -preset ultrafast -tune zerolatency -b:v $bitrate -g $fps -f mpegts -" |
+  mpv --profile=low-latency --no-cache --untimed --title=framecopy -
