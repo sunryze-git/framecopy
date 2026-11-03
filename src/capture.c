@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
 #include <signal.h>
@@ -39,7 +40,7 @@ static int spawn_helper(void)
     if (pid < 0)
         die("fork: %s", strerror(errno));
     if (pid == 0) {
-        if (dup2(sv[1], HELPER_SOCK_FD) < 0)
+        if (sv[1] == HELPER_SOCK_FD ? fcntl(sv[1], F_SETFD, 0) : dup2(sv[1], HELPER_SOCK_FD) < 0)
             _exit(127);
         execl(path, path, (char *)NULL);
         _exit(127);
