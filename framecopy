@@ -43,6 +43,8 @@ build() {
     return
   fi
   srcs=$(printf '%s\n' "$@" | grep '\.c$' | tr '\n' ' ')
+  # Copies from the nix store are read-only, so scp cannot overwrite them.
+  ssh "$host" "cd $remote && rm -f $*"
   (cd "$dir/src" && scp -q "$@" "$host:$remote/")
   ssh "$host" "cd $remote &&
     gcc -O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 -o $name $srcs $libs &&
