@@ -80,7 +80,15 @@
         pkgs: packages: {
           inherit (packages) tools;
           format = pkgs.runCommand "framecopy-format" { nativeBuildInputs = [ pkgs.clang-tools ]; } ''
-            cd ${./.}
+            cd ${
+              pkgs.lib.fileset.toSource {
+                root = ./.;
+                fileset = pkgs.lib.fileset.unions [
+                  ./.clang-format
+                  ./src
+                ];
+              }
+            }
             clang-format --dry-run -Werror src/*.c src/*.h
             touch $out
           '';
