@@ -14,3 +14,9 @@ The first run will build the helper applications on the Frame, and requires a on
 
 ## Nix
 `nix run . -- [options]` runs it with its dependencies, and `nix flake check` builds both programs for the current system and checks the C formatting.
+
+## Contributing
+See the [contribution guidelines](CONTRIBUTING.md).
+
+## License
+This project is MIT licensed.
