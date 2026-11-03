@@ -40,7 +40,7 @@ static struct {
 static struct source sources[MAX_SOURCES];
 static unsigned next_evict;
 
-static uint32_t find_memory_type(uint32_t bits, VkMemoryPropertyFlags want)
+static int find_memory_type(uint32_t bits, VkMemoryPropertyFlags want)
 {
     VkPhysicalDeviceMemoryProperties mp;
 
@@ -48,14 +48,17 @@ static uint32_t find_memory_type(uint32_t bits, VkMemoryPropertyFlags want)
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
         if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want)
             return i;
-    die("no suitable memory type");
+    return -1;
 }
 
 static VkDeviceMemory alloc_memory(VkMemoryRequirements req, VkMemoryPropertyFlags want)
 {
-    VkMemoryAllocateInfo info = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                 .allocationSize = req.size,
-                                 .memoryTypeIndex = find_memory_type(req.memoryTypeBits, want)};
+    int type = find_memory_type(req.memoryTypeBits, want);
+    if (type < 0)
+        die("no suitable memory type");
+
+    VkMemoryAllocateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
     VkDeviceMemory mem;
 
     VK(vkAllocateMemory(vk.dev, &info, NULL, &mem));
@@ -138,7 +141,9 @@ void gpu_init(uint32_t out_w, uint32_t out_h)
                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VK(vkCreateBuffer(vk.dev, &bci, NULL, &vk.buf));
     vkGetBufferMemoryRequirements(vk.dev, vk.buf, &req);
-    VkDeviceMemory bmem = alloc_memory(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    VkMemoryPropertyFlags cached = host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    VkDeviceMemory bmem = alloc_memory(req, find_memory_type(req.memoryTypeBits, cached) >= 0 ? cached : host);
     VK(vkBindBufferMemory(vk.dev, vk.buf, bmem, 0));
     VK(vkMapMemory(vk.dev, bmem, 0, bytes, 0, &vk.mapped));
 }
