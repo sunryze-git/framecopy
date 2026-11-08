@@ -31,6 +31,12 @@ if [[ -z $size ]]; then
 fi
 [[ $size =~ ^[0-9]+x[0-9]+$ ]] || usage
 
+control=$(mktemp -d)
+trap 'ssh -O exit "$host" 2>/dev/null; rm -r "$control"' EXIT
+ssh() { command ssh -o ControlPath="$control/socket" "$@"; }
+scp() { command scp -o ControlPath="$control/socket" "$@"; }
+ssh -fNM "$host"
+
 remote=$(ssh "$host" 'echo $HOME/.cache/framecopy')
 ssh "$host" "mkdir -p $remote"
 
