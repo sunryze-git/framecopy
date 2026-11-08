@@ -51,14 +51,15 @@ build() {
     echo $sum > $name.sum"
 }
 build framecopy-kms '$(pkg-config --cflags --libs libdrm)' kms.c proto.c proto.h util.h
-build framecopy-capture -lvulkan capture.c gpu.c gpu.h proto.c proto.h util.h
+build framecopy-capture -lvulkan capture.c clock.h enc.c enc.h gpu.c gpu.h proto.c proto.h util.h
 
 if ! ssh "$host" "getcap $remote/framecopy-kms" | grep -q cap_sys_admin; then
   echo "run once: ssh -t $host sudo setcap cap_sys_admin+ep $remote/framecopy-kms" >&2
   exit 1
 fi
 
-ssh "$host" "$remote/framecopy-capture -e $eye -s $size -f $fps |
-  ffmpeg -loglevel error -f rawvideo -pix_fmt bgr0 -video_size $size -framerate $fps -i - \
-    -vf format=yuv420p -c:v libx264 -preset ultrafast -tune zerolatency -b:v $bitrate -g $fps -f mpegts -" |
-  mpv --profile=low-latency --no-cache --untimed --title=framecopy -
+# The encoder writes full range BT.709 but labels it limited range.
+ssh "$host" "$remote/framecopy-capture -e $eye -s $size -f $fps -b $bitrate" |
+  mpv --profile=low-latency --no-cache --untimed --no-osc --osd-level=0 --hwdec=auto --vd-lavc-o=flags=+low_delay \
+    --demuxer-lavf-format=hevc --no-correct-pts --container-fps-override=$fps \
+    --vf=format=colorlevels=full:colormatrix=bt.709 --title=framecopy -

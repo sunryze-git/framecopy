@@ -31,7 +31,7 @@
 
             buildPhase = ''
               gcc -O2 -Wall -Wextra -Werror -o framecopy-kms kms.c proto.c $(pkg-config --cflags --libs libdrm)
-              gcc -O2 -Wall -Wextra -Werror -o framecopy-capture capture.c gpu.c proto.c -lvulkan
+              gcc -O2 -Wall -Wextra -Werror -o framecopy-capture capture.c enc.c gpu.c proto.c -lvulkan
             '';
             installPhase = ''
               install -Dm755 -t $out/bin framecopy-kms framecopy-capture

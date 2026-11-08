@@ -31,16 +31,17 @@ static struct {
     VkCommandBuffer cb;
     VkFence fence;
     VkImage dst;
-    VkBuffer buf;
-    void *mapped;
-    uint32_t out_w, out_h;
+    VkBuffer frames[ENC_BUFFERS];
+    uint32_t qf;
+    uint32_t out_w, out_h, stride;
     PFN_vkGetMemoryFdPropertiesKHR get_fd_props;
+    PFN_vkGetMemoryFdKHR get_fd;
 } vk;
 
 static struct source sources[MAX_SOURCES];
 static unsigned next_evict;
 
-static int find_memory_type(uint32_t bits, VkMemoryPropertyFlags want)
+static uint32_t find_memory_type(uint32_t bits, VkMemoryPropertyFlags want)
 {
     VkPhysicalDeviceMemoryProperties mp;
 
@@ -48,24 +49,49 @@ static int find_memory_type(uint32_t bits, VkMemoryPropertyFlags want)
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
         if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want)
             return i;
-    return -1;
+    die("no suitable memory type");
 }
 
-static VkDeviceMemory alloc_memory(VkMemoryRequirements req, VkMemoryPropertyFlags want)
+static VkDeviceMemory alloc_memory(VkMemoryRequirements req, VkMemoryPropertyFlags want, const void *next)
 {
-    int type = find_memory_type(req.memoryTypeBits, want);
-    if (type < 0)
-        die("no suitable memory type");
-
-    VkMemoryAllocateInfo info = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
+    VkMemoryAllocateInfo info = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .pNext = next,
+                                 .allocationSize = req.size,
+                                 .memoryTypeIndex = find_memory_type(req.memoryTypeBits, want)};
     VkDeviceMemory mem;
 
     VK(vkAllocateMemory(vk.dev, &info, NULL, &mem));
     return mem;
 }
 
-void gpu_init(uint32_t out_w, uint32_t out_h)
+static int export_frame(VkBuffer *buf, VkDeviceSize size)
+{
+    VkExternalMemoryBufferCreateInfo ext = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                              .pNext = &ext,
+                              .size = size,
+                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkMemoryRequirements req;
+
+    VK(vkCreateBuffer(vk.dev, &bci, NULL, buf));
+    vkGetBufferMemoryRequirements(vk.dev, *buf, &req);
+
+    VkExportMemoryAllocateInfo exp = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+                                      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkDeviceMemory mem = alloc_memory(req, 0, &exp);
+    VK(vkBindBufferMemory(vk.dev, *buf, mem, 0));
+
+    VkMemoryGetFdInfoKHR gfi = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+                                .memory = mem,
+                                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    int fd;
+    VK(vk.get_fd(vk.dev, &gfi, &fd));
+    return fd;
+}
+
+void gpu_init(uint32_t out_w, uint32_t out_h, struct enc_layout layout, int fds[ENC_BUFFERS])
 {
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
@@ -74,6 +100,9 @@ void gpu_init(uint32_t out_w, uint32_t out_h)
 
     vk.out_w = out_w;
     vk.out_h = out_h;
+    vk.stride = layout.stride;
+    if (layout.stride % 4 || layout.stride < out_w * 4)
+        die("unsupported encoder stride %u", layout.stride);
 
     VK(vkCreateInstance(&ici, NULL, &inst));
     VkResult r = vkEnumeratePhysicalDevices(inst, &n, &vk.pd);
@@ -91,7 +120,7 @@ void gpu_init(uint32_t out_w, uint32_t out_h)
         die("no graphics queue");
 
     const char *exts[] = {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-                          VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME};
+                          VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME};
     float prio = 1;
     VkDeviceQueueCreateInfo dq = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                   .queueFamilyIndex = qf,
@@ -100,11 +129,13 @@ void gpu_init(uint32_t out_w, uint32_t out_h)
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                               .queueCreateInfoCount = 1,
                               .pQueueCreateInfos = &dq,
-                              .enabledExtensionCount = 3,
+                              .enabledExtensionCount = 4,
                               .ppEnabledExtensionNames = exts};
     VK(vkCreateDevice(vk.pd, &dci, NULL, &vk.dev));
     vkGetDeviceQueue(vk.dev, qf, 0, &vk.queue);
+    vk.qf = qf;
     vk.get_fd_props = (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(vk.dev, "vkGetMemoryFdPropertiesKHR");
+    vk.get_fd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(vk.dev, "vkGetMemoryFdKHR");
 
     VkCommandPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -121,7 +152,7 @@ void gpu_init(uint32_t out_w, uint32_t out_h)
 
     VkImageCreateInfo dsti = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                               .imageType = VK_IMAGE_TYPE_2D,
-                              .format = VK_FORMAT_B8G8R8A8_UNORM,
+                              .format = VK_FORMAT_R8G8B8A8_UNORM,
                               .extent = {out_w, out_h, 1},
                               .mipLevels = 1,
                               .arrayLayers = 1,
@@ -132,20 +163,10 @@ void gpu_init(uint32_t out_w, uint32_t out_h)
     VkMemoryRequirements req;
     VK(vkCreateImage(vk.dev, &dsti, NULL, &vk.dst));
     vkGetImageMemoryRequirements(vk.dev, vk.dst, &req);
-    VK(vkBindImageMemory(vk.dev, vk.dst, alloc_memory(req, 0), 0));
+    VK(vkBindImageMemory(vk.dev, vk.dst, alloc_memory(req, 0, NULL), 0));
 
-    VkDeviceSize bytes = (VkDeviceSize)out_w * out_h * 4;
-    VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                              .size = bytes,
-                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    VK(vkCreateBuffer(vk.dev, &bci, NULL, &vk.buf));
-    vkGetBufferMemoryRequirements(vk.dev, vk.buf, &req);
-    VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    VkMemoryPropertyFlags cached = host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-    VkDeviceMemory bmem = alloc_memory(req, find_memory_type(req.memoryTypeBits, cached) >= 0 ? cached : host);
-    VK(vkBindBufferMemory(vk.dev, vk.buf, bmem, 0));
-    VK(vkMapMemory(vk.dev, bmem, 0, bytes, 0, &vk.mapped));
+    for (int i = 0; i < ENC_BUFFERS; i++)
+        fds[i] = export_frame(&vk.frames[i], layout.size);
 }
 
 static struct source *import_source(const struct fb_info *info, int fd, uint64_t ino)
@@ -265,7 +286,20 @@ static void blit_eye(const struct source *s, int eye, int32_t x0, int32_t x1)
                    VK_FILTER_LINEAR);
 }
 
-const void *gpu_capture(const struct fb_info *info, int fd, enum eye eye)
+static void release_frame(VkBuffer frame)
+{
+    VkBufferMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                               .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                               .srcQueueFamilyIndex = vk.qf,
+                               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+                               .buffer = frame,
+                               .size = VK_WHOLE_SIZE};
+
+    vkCmdPipelineBarrier(vk.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 1, &b,
+                         0, NULL);
+}
+
+void gpu_capture(const struct fb_info *info, int fd, enum eye eye, int buffer)
 {
     const struct source *s = find_source(info, fd);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -284,14 +318,15 @@ const void *gpu_capture(const struct fb_info *info, int fd, enum eye eye)
 
     image_barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+    VkBufferImageCopy copy = {.bufferRowLength = vk.stride / 4,
+                              .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                               .imageExtent = {vk.out_w, vk.out_h, 1}};
-    vkCmdCopyImageToBuffer(vk.cb, vk.dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.buf, 1, &copy);
+    vkCmdCopyImageToBuffer(vk.cb, vk.dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.frames[buffer], 1, &copy);
+    release_frame(vk.frames[buffer]);
     VK(vkEndCommandBuffer(vk.cb));
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &vk.cb};
     VK(vkQueueSubmit(vk.queue, 1, &si, vk.fence));
     VK(vkWaitForFences(vk.dev, 1, &vk.fence, VK_TRUE, UINT64_MAX));
     VK(vkResetFences(vk.dev, 1, &vk.fence));
-    return vk.mapped;
 }

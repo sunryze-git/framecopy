@@ -6,19 +6,22 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
+#include "clock.h"
+#include "enc.h"
 #include "gpu.h"
 #include "proto.h"
 #include "util.h"
 
-#define MAX_DIM 8192
+/* Larger frames reset the whole Frame when the encoder starts. */
+#define MAX_WIDTH 3840
+#define MAX_HEIGHT 1920
 #define MAX_FPS 240
 
 static void usage(void)
 {
-    fputs("usage: framecopy-capture -s WxH -f fps [-e both|left|right]\n", stderr);
+    fputs("usage: framecopy-capture -s WxH -f fps -b bitrate [-e both|left|right]\n", stderr);
     exit(2);
 }
 
@@ -62,42 +65,32 @@ static int request_fb(int sock, struct fb_info *info)
     return fd;
 }
 
-static void write_frame(const char *p, size_t len)
+static int parse_bitrate(const char *s, unsigned *bitrate)
 {
-    while (len) {
-        ssize_t n = write(STDOUT_FILENO, p, len);
+    char *unit;
+    unsigned long long v = strtoull(s, &unit, 10);
 
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            exit(errno == EPIPE ? 0 : 1);
-        p += n;
-        len -= n;
-    }
-}
-
-static int64_t now_ns(void)
-{
-    struct timespec t;
-
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec * 1000000000LL + t.tv_nsec;
-}
-
-static void sleep_until(int64_t ns)
-{
-    struct timespec t = {ns / 1000000000LL, ns % 1000000000LL};
-
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL);
+    if (unit == s)
+        return -1;
+    if (*unit == 'k' || *unit == 'K')
+        v *= 1000;
+    else if (*unit == 'm' || *unit == 'M')
+        v *= 1000000;
+    else if (*unit)
+        return -1;
+    if ((*unit && unit[1]) || v > UINT_MAX)
+        return -1;
+    *bitrate = v;
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
     enum eye eye = EYE_BOTH;
-    unsigned w = 0, h = 0, fps = 0;
+    unsigned w = 0, h = 0, fps = 0, bitrate = 0;
     int len = 0;
 
-    for (int c; (c = getopt(argc, argv, "e:s:f:")) != -1;) {
+    for (int c; (c = getopt(argc, argv, "e:s:f:b:")) != -1;) {
         if (c == 'e' && !strcmp(optarg, "both"))
             eye = EYE_BOTH;
         else if (c == 'e' && !strcmp(optarg, "left"))
@@ -108,15 +101,19 @@ int main(int argc, char **argv)
             continue;
         else if (c == 'f' && sscanf(optarg, "%u%n", &fps, &len) == 1 && !optarg[len])
             continue;
+        else if (c == 'b' && !parse_bitrate(optarg, &bitrate))
+            continue;
         else
             usage();
     }
-    if (!w || !h || !fps || w > MAX_DIM || h > MAX_DIM || fps > MAX_FPS || w % 4 || h % 2)
+    if (!w || !h || !fps || !bitrate || w > MAX_WIDTH || h > MAX_HEIGHT || fps > MAX_FPS || w % 4 || h % 2)
         usage();
 
     signal(SIGPIPE, SIG_IGN);
     int sock = spawn_helper();
-    gpu_init(w, h);
+    int frames[ENC_BUFFERS];
+    gpu_init(w, h, enc_init(w, h, fps, bitrate), frames);
+    enc_start(frames);
 
     int64_t next = now_ns();
     for (;;) {
@@ -128,14 +125,15 @@ int main(int argc, char **argv)
         if (info.status == FB_UNSUPPORTED)
             die("multi-plane framebuffers are not supported");
         if (info.status == FB_OK) {
-            write_frame(gpu_capture(&info, fd, eye), (size_t)w * h * 4);
+            int frame = enc_acquire();
+            gpu_capture(&info, fd, eye, frame);
+            enc_submit(frame);
             close(fd);
         }
 
         next += 1000000000LL / fps;
         if (next < now_ns())
             next = now_ns();
-        else
-            sleep_until(next);
+        enc_drain_until(next);
     }
 }
