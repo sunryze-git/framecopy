@@ -5,6 +5,7 @@
 #include <vulkan/vulkan.h>
 
 #include "gpu.h"
+#include "nv12.spv.h"
 #include "util.h"
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
@@ -31,9 +32,18 @@ static struct {
     VkCommandBuffer cb;
     VkFence fence;
     VkImage dst;
+    VkImageView view;
     VkBuffer frames[ENC_BUFFERS];
+    VkPipelineLayout layout;
+    VkPipeline pipeline;
+    VkDescriptorSet sets[ENC_BUFFERS];
     uint32_t qf;
-    uint32_t out_w, out_h, stride;
+    uint32_t out_w, out_h;
+    struct {
+        uint32_t blocks[2];
+        uint32_t stride;
+        uint32_t uv;
+    } push;
     PFN_vkGetMemoryFdPropertiesKHR get_fd_props;
     PFN_vkGetMemoryFdKHR get_fd;
 } vk;
@@ -71,7 +81,7 @@ static int export_frame(VkBuffer *buf, VkDeviceSize size)
     VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                               .pNext = &ext,
                               .size = size,
-                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VkMemoryRequirements req;
 
@@ -91,6 +101,77 @@ static int export_frame(VkBuffer *buf, VkDeviceSize size)
     return fd;
 }
 
+static void create_pipeline(void)
+{
+    VkDescriptorSetLayoutBinding bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+    };
+    VkDescriptorSetLayoutCreateInfo dli = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bindings};
+    VkDescriptorSetLayout dl;
+    VK(vkCreateDescriptorSetLayout(vk.dev, &dli, NULL, &dl));
+
+    VkPushConstantRange pc = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vk.push)};
+    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                      .setLayoutCount = 1,
+                                      .pSetLayouts = &dl,
+                                      .pushConstantRangeCount = 1,
+                                      .pPushConstantRanges = &pc};
+    VK(vkCreatePipelineLayout(vk.dev, &pli, NULL, &vk.layout));
+
+    VkShaderModuleCreateInfo smi = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof(nv12_spv), .pCode = nv12_spv};
+    VkShaderModule sm;
+    VK(vkCreateShaderModule(vk.dev, &smi, NULL, &sm));
+    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                 .module = sm,
+                                                 .pName = "main"},
+                                       .layout = vk.layout};
+    VK(vkCreateComputePipelines(vk.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &vk.pipeline));
+    vkDestroyShaderModule(vk.dev, sm, NULL);
+
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ENC_BUFFERS},
+                                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, ENC_BUFFERS}};
+    VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                      .maxSets = ENC_BUFFERS,
+                                      .poolSizeCount = 2,
+                                      .pPoolSizes = sizes};
+    VkDescriptorPool pool;
+    VK(vkCreateDescriptorPool(vk.dev, &dpi, NULL, &pool));
+
+    VkDescriptorSetLayout dls[ENC_BUFFERS];
+    for (int i = 0; i < ENC_BUFFERS; i++)
+        dls[i] = dl;
+    VkDescriptorSetAllocateInfo dai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                       .descriptorPool = pool,
+                                       .descriptorSetCount = ENC_BUFFERS,
+                                       .pSetLayouts = dls};
+    VK(vkAllocateDescriptorSets(vk.dev, &dai, vk.sets));
+
+    VkDescriptorImageInfo image = {.imageView = vk.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    for (int i = 0; i < ENC_BUFFERS; i++) {
+        VkDescriptorBufferInfo buffer = {vk.frames[i], 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet writes[] = {
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+             .dstSet = vk.sets[i],
+             .dstBinding = 0,
+             .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+             .pImageInfo = &image},
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+             .dstSet = vk.sets[i],
+             .dstBinding = 1,
+             .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+             .pBufferInfo = &buffer},
+        };
+        vkUpdateDescriptorSets(vk.dev, 2, writes, 0, NULL);
+    }
+}
+
 void gpu_init(uint32_t out_w, uint32_t out_h, struct enc_layout layout, int fds[ENC_BUFFERS])
 {
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3};
@@ -100,9 +181,12 @@ void gpu_init(uint32_t out_w, uint32_t out_h, struct enc_layout layout, int fds[
 
     vk.out_w = out_w;
     vk.out_h = out_h;
-    vk.stride = layout.stride;
-    if (layout.stride % 4 || layout.stride < out_w * 4)
+    if (layout.stride % 4 || layout.stride < out_w)
         die("unsupported encoder stride %u", layout.stride);
+    vk.push.blocks[0] = out_w / 4;
+    vk.push.blocks[1] = out_h / 2;
+    vk.push.stride = layout.stride / 4;
+    vk.push.uv = layout.uv_offset / 4;
 
     VK(vkCreateInstance(&ici, NULL, &inst));
     VkResult r = vkEnumeratePhysicalDevices(inst, &n, &vk.pd);
@@ -158,15 +242,22 @@ void gpu_init(uint32_t out_w, uint32_t out_h, struct enc_layout layout, int fds[
                               .arrayLayers = 1,
                               .samples = VK_SAMPLE_COUNT_1_BIT,
                               .tiling = VK_IMAGE_TILING_OPTIMAL,
-                              .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                              .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                               .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VkMemoryRequirements req;
     VK(vkCreateImage(vk.dev, &dsti, NULL, &vk.dst));
     vkGetImageMemoryRequirements(vk.dev, vk.dst, &req);
     VK(vkBindImageMemory(vk.dev, vk.dst, alloc_memory(req, 0, NULL), 0));
+    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                 .image = vk.dst,
+                                 .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                 .format = VK_FORMAT_R8G8B8A8_UNORM,
+                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VK(vkCreateImageView(vk.dev, &vci, NULL, &vk.view));
 
     for (int i = 0; i < ENC_BUFFERS; i++)
         fds[i] = export_frame(&vk.frames[i], layout.size);
+    create_pipeline();
 }
 
 static struct source *import_source(const struct fb_info *info, int fd, uint64_t ino)
@@ -257,7 +348,8 @@ static struct source *find_source(const struct fb_info *info, int fd)
     return import_source(info, fd, st.st_ino);
 }
 
-static void image_barrier(VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst)
+static void image_barrier(VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst,
+                          VkPipelineStageFlags dst_stage)
 {
     VkImageMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                               .srcAccessMask = src,
@@ -269,8 +361,7 @@ static void image_barrier(VkImageLayout from, VkImageLayout to, VkAccessFlags sr
                               .image = vk.dst,
                               .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
 
-    vkCmdPipelineBarrier(vk.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
-                         &b);
+    vkCmdPipelineBarrier(vk.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
 /* Each eye is one half of the panel image, rotated 180 degrees. */
@@ -289,14 +380,14 @@ static void blit_eye(const struct source *s, int eye, int32_t x0, int32_t x1)
 static void release_frame(VkBuffer frame)
 {
     VkBufferMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-                               .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                               .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
                                .srcQueueFamilyIndex = vk.qf,
                                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
                                .buffer = frame,
                                .size = VK_WHOLE_SIZE};
 
-    vkCmdPipelineBarrier(vk.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 1, &b,
-                         0, NULL);
+    vkCmdPipelineBarrier(vk.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL,
+                         1, &b, 0, NULL);
 }
 
 void gpu_capture(const struct fb_info *info, int fd, enum eye eye, int buffer)
@@ -307,7 +398,8 @@ void gpu_capture(const struct fb_info *info, int fd, enum eye eye, int buffer)
 
     VK(vkResetCommandBuffer(vk.cb, 0));
     VK(vkBeginCommandBuffer(vk.cb, &bi));
-    image_barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    image_barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT);
 
     if (eye == EYE_BOTH) {
         blit_eye(s, 0, 0, vk.out_w / 2);
@@ -316,12 +408,12 @@ void gpu_capture(const struct fb_info *info, int fd, enum eye eye, int buffer)
         blit_eye(s, eye == EYE_RIGHT, 0, vk.out_w);
     }
 
-    image_barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    VkBufferImageCopy copy = {.bufferRowLength = vk.stride / 4,
-                              .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                              .imageExtent = {vk.out_w, vk.out_h, 1}};
-    vkCmdCopyImageToBuffer(vk.cb, vk.dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.frames[buffer], 1, &copy);
+    image_barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    vkCmdBindPipeline(vk.cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipeline);
+    vkCmdBindDescriptorSets(vk.cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk.layout, 0, 1, &vk.sets[buffer], 0, NULL);
+    vkCmdPushConstants(vk.cb, vk.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vk.push), &vk.push);
+    vkCmdDispatch(vk.cb, (vk.push.blocks[0] + 7) / 8, (vk.push.blocks[1] + 7) / 8, 1);
     release_frame(vk.frames[buffer]);
     VK(vkEndCommandBuffer(vk.cb));
 

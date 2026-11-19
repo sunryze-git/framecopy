@@ -99,7 +99,10 @@
         pkgs: packages: {
           default = pkgs.mkShell {
             inputsFrom = [ packages.tools ];
-            packages = [ pkgs.clang-tools ];
+            packages = [
+              pkgs.clang-tools
+              pkgs.glslang
+            ];
           };
         }
       );

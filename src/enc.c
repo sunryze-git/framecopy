@@ -45,6 +45,10 @@ static void set_format(uint32_t type, uint32_t w, uint32_t h, uint32_t fourcc, s
     f->fmt.pix_mp.height = h;
     f->fmt.pix_mp.pixelformat = fourcc;
     f->fmt.pix_mp.num_planes = 1;
+    f->fmt.pix_mp.colorspace = V4L2_COLORSPACE_REC709;
+    f->fmt.pix_mp.xfer_func = V4L2_XFER_FUNC_709;
+    f->fmt.pix_mp.ycbcr_enc = V4L2_YCBCR_ENC_709;
+    f->fmt.pix_mp.quantization = V4L2_QUANTIZATION_LIM_RANGE;
     xioctl(VIDIOC_S_FMT, f, "VIDIOC_S_FMT");
     if (f->fmt.pix_mp.pixelformat != fourcc)
         die("encoder does not support %.4s", (char *)&fourcc);
@@ -53,6 +57,13 @@ static void set_format(uint32_t type, uint32_t w, uint32_t h, uint32_t fourcc, s
 static int has_size(const struct v4l2_format *f, uint32_t w, uint32_t h)
 {
     return f->fmt.pix_mp.width == w && f->fmt.pix_mp.height == h;
+}
+
+static void set_crop(uint32_t w, uint32_t h)
+{
+    struct v4l2_selection s = {.type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .target = V4L2_SEL_TGT_CROP, .r = {0, 0, w, h}};
+
+    xioctl(VIDIOC_S_SELECTION, &s, "VIDIOC_S_SELECTION");
 }
 
 static void queue_coded(uint32_t index)
@@ -99,9 +110,13 @@ struct enc_layout enc_init(uint32_t w, uint32_t h, unsigned fps, unsigned bitrat
         die("%s: %s", ENC_DEVICE, strerror(errno));
 
     set_format(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, w, h, V4L2_PIX_FMT_HEVC, &coded);
-    set_format(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, w, h, V4L2_PIX_FMT_RGBA32, &raw);
+    set_format(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, w, h, V4L2_PIX_FMT_NV12, &raw);
+    if (raw.fmt.pix_mp.width < w || raw.fmt.pix_mp.height < h)
+        die("encoder does not support %ux%u", w, h);
+    if (!has_size(&raw, w, h))
+        set_crop(w, h);
     xioctl(VIDIOC_G_FMT, &coded, "VIDIOC_G_FMT");
-    if (!has_size(&raw, w, h) || !has_size(&coded, w, h))
+    if (!has_size(&coded, w, h))
         die("encoder does not support %ux%u", w, h);
 
     struct v4l2_streamparm parm = {.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE};
@@ -116,7 +131,8 @@ struct enc_layout enc_init(uint32_t w, uint32_t h, unsigned fps, unsigned bitrat
 
     map_coded_buffers();
     enc.frame_size = raw.fmt.pix_mp.plane_fmt[0].sizeimage;
-    return (struct enc_layout){raw.fmt.pix_mp.plane_fmt[0].bytesperline, enc.frame_size};
+    uint32_t stride = raw.fmt.pix_mp.plane_fmt[0].bytesperline;
+    return (struct enc_layout){stride, stride * raw.fmt.pix_mp.height, enc.frame_size};
 }
 
 void enc_start(const int fds[ENC_BUFFERS])
